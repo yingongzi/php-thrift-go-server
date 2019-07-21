@@ -1,0 +1,16 @@
+hash: 67977bbb644b50935bb5e9a60bf64488cd25c58c721e31136a1791e1d43f9e9a
+updated: 2019-07-21T13:28:27.983243+08:00
+imports:
+- name: github.com/go-redis/redis
+  version: 6f8957c5b7dece15d1ea5f592ec88f46ee2deffa
+- name: github.com/json-iterator/go
+  version: 1624edc4454b8682399def8740d46db5e4362ba4
+- name: github.com/pelletier/go-buffruneio
+  version: c37440a7cf42ac63b919c752ca73a85067e05992
+- name: github.com/pelletier/go-toml
+  version: 13d49d4606eb801b8f01ae542b4afc4c6ee3d84a
+- name: github.com/sirupsen/logrus
+  version: 839c75faf7f98a33d445d181f3018b5c3409a45e
+- name: github.com/yingongzi/php-thrift
+  version: ebe4bc2c510cc1a0124179d65770ec5b587a71d2
+testImports: []
