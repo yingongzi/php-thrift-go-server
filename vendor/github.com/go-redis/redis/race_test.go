@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/go-redis/redis"
+
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-
-	"gopkg.in/redis.v5"
-	"gopkg.in/redis.v5/internal/pool"
 )
 
 var _ = Describe("races", func() {
@@ -21,7 +21,7 @@ var _ = Describe("races", func() {
 
 	BeforeEach(func() {
 		client = redis.NewClient(redisOptions())
-		Expect(client.FlushDb().Err()).To(BeNil())
+		Expect(client.FlushDB().Err()).To(BeNil())
 
 		C, N = 10, 1000
 		if testing.Short() {
@@ -104,7 +104,9 @@ var _ = Describe("races", func() {
 	})
 
 	It("should handle big vals in Get", func() {
-		bigVal := string(bytes.Repeat([]byte{'*'}, 1<<17)) // 128kb
+		C, N = 4, 100
+
+		bigVal := bigVal()
 
 		err := client.Set("key", bigVal, 0).Err()
 		Expect(err).NotTo(HaveOccurred())
@@ -115,7 +117,7 @@ var _ = Describe("races", func() {
 
 		perform(C, func(id int) {
 			for i := 0; i < N; i++ {
-				got, err := client.Get("key").Result()
+				got, err := client.Get("key").Bytes()
 				Expect(err).NotTo(HaveOccurred())
 				Expect(got).To(Equal(bigVal))
 			}
@@ -124,45 +126,14 @@ var _ = Describe("races", func() {
 
 	It("should handle big vals in Set", func() {
 		C, N = 4, 100
-		bigVal := string(bytes.Repeat([]byte{'*'}, 1<<17)) // 128kb
 
+		bigVal := bigVal()
 		perform(C, func(id int) {
 			for i := 0; i < N; i++ {
 				err := client.Set("key", bigVal, 0).Err()
 				Expect(err).NotTo(HaveOccurred())
 			}
 		})
-	})
-
-	It("should PubSub", func() {
-		connPool := client.Pool()
-		connPool.(*pool.ConnPool).DialLimiter = nil
-
-		perform(C, func(id int) {
-			for i := 0; i < N; i++ {
-				pubsub, err := client.Subscribe(fmt.Sprintf("mychannel%d", id))
-				Expect(err).NotTo(HaveOccurred())
-
-				go func() {
-					defer GinkgoRecover()
-
-					time.Sleep(time.Millisecond)
-					err := pubsub.Close()
-					Expect(err).NotTo(HaveOccurred())
-				}()
-
-				_, err = pubsub.ReceiveMessage()
-				Expect(err.Error()).To(ContainSubstring("closed"))
-
-				val := "echo" + strconv.Itoa(i)
-				echo, err := client.Echo(val).Result()
-				Expect(err).NotTo(HaveOccurred())
-				Expect(echo).To(Equal(val))
-			}
-		})
-
-		Expect(connPool.Len()).To(Equal(connPool.FreeLen()))
-		Expect(connPool.Len()).To(BeNumerically("<=", 10))
 	})
 
 	It("should select db", func() {
@@ -222,7 +193,7 @@ var _ = Describe("races", func() {
 					num, err := strconv.ParseInt(val, 10, 64)
 					Expect(err).NotTo(HaveOccurred())
 
-					cmds, err := tx.Pipelined(func(pipe *redis.Pipeline) error {
+					cmds, err := tx.Pipelined(func(pipe redis.Pipeliner) error {
 						pipe.Set("key", strconv.FormatInt(num+1, 10), 0)
 						return nil
 					})
@@ -242,4 +213,135 @@ var _ = Describe("races", func() {
 		Expect(val).To(Equal(int64(C * N)))
 	})
 
+	It("should Pipeline", func() {
+		perform(C, func(id int) {
+			pipe := client.Pipeline()
+			for i := 0; i < N; i++ {
+				pipe.Echo(fmt.Sprint(i))
+			}
+
+			cmds, err := pipe.Exec()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cmds).To(HaveLen(N))
+
+			for i := 0; i < N; i++ {
+				Expect(cmds[i].(*redis.StringCmd).Val()).To(Equal(fmt.Sprint(i)))
+			}
+		})
+	})
+
+	It("should Pipeline", func() {
+		pipe := client.Pipeline()
+		perform(N, func(id int) {
+			pipe.Incr("key")
+		})
+
+		cmds, err := pipe.Exec()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cmds).To(HaveLen(N))
+
+		n, err := client.Get("key").Int64()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(Equal(int64(N)))
+	})
+
+	It("should TxPipeline", func() {
+		pipe := client.TxPipeline()
+		perform(N, func(id int) {
+			pipe.Incr("key")
+		})
+
+		cmds, err := pipe.Exec()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(cmds).To(HaveLen(N))
+
+		n, err := client.Get("key").Int64()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(n).To(Equal(int64(N)))
+	})
+
+	It("should BLPop", func() {
+		var received uint32
+		wg := performAsync(C, func(id int) {
+			for {
+				v, err := client.BLPop(3*time.Second, "list").Result()
+				if err != nil {
+					break
+				}
+				Expect(v).To(Equal([]string{"list", "hello"}))
+				atomic.AddUint32(&received, 1)
+			}
+		})
+
+		perform(C, func(id int) {
+			for i := 0; i < N; i++ {
+				err := client.LPush("list", "hello").Err()
+				Expect(err).NotTo(HaveOccurred())
+			}
+		})
+
+		wg.Wait()
+		Expect(received).To(Equal(uint32(C * N)))
+	})
 })
+
+var _ = Describe("cluster races", func() {
+	var client *redis.ClusterClient
+	var C, N int
+
+	BeforeEach(func() {
+		opt := redisClusterOptions()
+		client = cluster.clusterClient(opt)
+
+		C, N = 10, 1000
+		if testing.Short() {
+			C = 4
+			N = 100
+		}
+	})
+
+	AfterEach(func() {
+		err := client.Close()
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should echo", func() {
+		perform(C, func(id int) {
+			for i := 0; i < N; i++ {
+				msg := fmt.Sprintf("echo %d %d", id, i)
+				echo, err := client.Echo(msg).Result()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(echo).To(Equal(msg))
+			}
+		})
+	})
+
+	It("should get", func() {
+		perform(C, func(id int) {
+			for i := 0; i < N; i++ {
+				key := fmt.Sprintf("key_%d_%d", id, i)
+				_, err := client.Get(key).Result()
+				Expect(err).To(Equal(redis.Nil))
+			}
+		})
+	})
+
+	It("should incr", func() {
+		key := "TestIncrFromGoroutines"
+
+		perform(C, func(id int) {
+			for i := 0; i < N; i++ {
+				err := client.Incr(key).Err()
+				Expect(err).NotTo(HaveOccurred())
+			}
+		})
+
+		val, err := client.Get(key).Int64()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(val).To(Equal(int64(C * N)))
+	})
+})
+
+func bigVal() []byte {
+	return bytes.Repeat([]byte{'*'}, 1<<17) // 128kb
+}

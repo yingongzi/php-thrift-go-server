@@ -1,52 +1,43 @@
-# Redis client for Golang [![Build Status](https://travis-ci.org/go-redis/redis.png?branch=master)](https://travis-ci.org/go-redis/redis)
+# Redis client for Golang
+
+[![Build Status](https://travis-ci.org/go-redis/redis.png?branch=master)](https://travis-ci.org/go-redis/redis)
+[![GoDoc](https://godoc.org/github.com/go-redis/redis?status.svg)](https://godoc.org/github.com/go-redis/redis)
+[![Airbrake](https://img.shields.io/badge/kudos-airbrake.io-orange.svg)](https://airbrake.io)
 
 Supports:
 
 - Redis 3 commands except QUIT, MONITOR, SLOWLOG and SYNC.
-- [Pub/Sub](http://godoc.org/gopkg.in/redis.v5#PubSub).
-- [Transactions](http://godoc.org/gopkg.in/redis.v5#Multi).
-- [Pipelining](http://godoc.org/gopkg.in/redis.v5#Client.Pipeline).
-- [Scripting](http://godoc.org/gopkg.in/redis.v5#Script).
-- [Timeouts](http://godoc.org/gopkg.in/redis.v5#Options).
-- [Redis Sentinel](http://godoc.org/gopkg.in/redis.v5#NewFailoverClient).
-- [Redis Cluster](http://godoc.org/gopkg.in/redis.v5#NewClusterClient).
-- [Ring](http://godoc.org/gopkg.in/redis.v5#NewRing).
+- Automatic connection pooling with [circuit breaker](https://en.wikipedia.org/wiki/Circuit_breaker_design_pattern) support.
+- [Pub/Sub](https://godoc.org/github.com/go-redis/redis#PubSub).
+- [Transactions](https://godoc.org/github.com/go-redis/redis#example-Client-TxPipeline).
+- [Pipeline](https://godoc.org/github.com/go-redis/redis#example-Client-Pipeline) and [TxPipeline](https://godoc.org/github.com/go-redis/redis#example-Client-TxPipeline).
+- [Scripting](https://godoc.org/github.com/go-redis/redis#Script).
+- [Timeouts](https://godoc.org/github.com/go-redis/redis#Options).
+- [Redis Sentinel](https://godoc.org/github.com/go-redis/redis#NewFailoverClient).
+- [Redis Cluster](https://godoc.org/github.com/go-redis/redis#NewClusterClient).
+- [Cluster of Redis Servers](https://godoc.org/github.com/go-redis/redis#example-NewClusterClient--ManualSetup) without using cluster mode and Redis Sentinel.
+- [Ring](https://godoc.org/github.com/go-redis/redis#NewRing).
+- [Instrumentation](https://godoc.org/github.com/go-redis/redis#ex-package--Instrumentation).
 - [Cache friendly](https://github.com/go-redis/cache).
-- [Rate limiting](https://github.com/go-redis/rate).
+- [Rate limiting](https://github.com/go-redis/redis_rate).
 - [Distributed Locks](https://github.com/bsm/redis-lock).
 
-API docs: http://godoc.org/gopkg.in/redis.v5.
-Examples: http://godoc.org/gopkg.in/redis.v5#pkg-examples.
+API docs: https://godoc.org/github.com/go-redis/redis.
+Examples: https://godoc.org/github.com/go-redis/redis#pkg-examples.
 
 ## Installation
 
 Install:
 
 ```shell
-go get gopkg.in/redis.v5
+go get -u github.com/go-redis/redis
 ```
 
 Import:
 
 ```go
-import "gopkg.in/redis.v5"
+import "github.com/go-redis/redis"
 ```
-
-## Vendoring
-
-If you are using a vendoring tool with support for semantic versioning
-e.g. [glide](https://github.com/Masterminds/glide), you can import this
-package via its GitHub URL:
-
-```yaml
-- package: github.com/go-redis/redis
-  version: ^5.0.0
-```
-
-WARNING: please note that by importing `github.com/go-redis/redis`
-directly (without semantic versioning constrol) you are in danger of
-running in the breaking API changes. Use carefully and at your own
-risk!
 
 ## Quickstart
 
@@ -77,44 +68,46 @@ func ExampleClient() {
 
 	val2, err := client.Get("key2").Result()
 	if err == redis.Nil {
-		fmt.Println("key2 does not exists")
+		fmt.Println("key2 does not exist")
 	} else if err != nil {
 		panic(err)
 	} else {
 		fmt.Println("key2", val2)
 	}
 	// Output: key value
-	// key2 does not exists
+	// key2 does not exist
 }
 ```
 
 ## Howto
 
-Please go through [examples](http://godoc.org/gopkg.in/redis.v5#pkg-examples) to get an idea how to use this package.
+Please go through [examples](https://godoc.org/github.com/go-redis/redis#pkg-examples) to get an idea how to use this package.
 
 ## Look and feel
 
 Some corner cases:
 
-    SET key value EX 10 NX
-    set, err := client.SetNX("key", "value", 10*time.Second).Result()
+```go
+// SET key value EX 10 NX
+set, err := client.SetNX("key", "value", 10*time.Second).Result()
 
-    SORT list LIMIT 0 2 ASC
-    vals, err := client.Sort("list", redis.Sort{Offset: 0, Count: 2, Order: "ASC"}).Result()
+// SORT list LIMIT 0 2 ASC
+vals, err := client.Sort("list", redis.Sort{Offset: 0, Count: 2, Order: "ASC"}).Result()
 
-    ZRANGEBYSCORE zset -inf +inf WITHSCORES LIMIT 0 2
-    vals, err := client.ZRangeByScoreWithScores("zset", redis.ZRangeByScore{
-        Min: "-inf",
-        Max: "+inf",
-        Offset: 0,
-        Count: 2,
-    }).Result()
+// ZRANGEBYSCORE zset -inf +inf WITHSCORES LIMIT 0 2
+vals, err := client.ZRangeByScoreWithScores("zset", redis.ZRangeBy{
+	Min: "-inf",
+	Max: "+inf",
+	Offset: 0,
+	Count: 2,
+}).Result()
 
-    ZINTERSTORE out 2 zset1 zset2 WEIGHTS 2 3 AGGREGATE SUM
-    vals, err := client.ZInterStore("out", redis.ZStore{Weights: []int64{2, 3}}, "zset1", "zset2").Result()
+// ZINTERSTORE out 2 zset1 zset2 WEIGHTS 2 3 AGGREGATE SUM
+vals, err := client.ZInterStore("out", redis.ZStore{Weights: []int64{2, 3}}, "zset1", "zset2").Result()
 
-    EVAL "return {KEYS[1],ARGV[1]}" 1 "key" "hello"
-    vals, err := client.Eval("return {KEYS[1],ARGV[1]}", []string{"key"}, []string{"hello"}).Result()
+// EVAL "return {KEYS[1],ARGV[1]}" 1 "key" "hello"
+vals, err := client.Eval("return {KEYS[1],ARGV[1]}", []string{"key"}, "hello").Result()
+```
 
 ## Benchmark
 
@@ -146,6 +139,8 @@ BenchmarkRedisPing-4                	  200000	      6983 ns/op	     116 B/op	   
 BenchmarkRedisClusterPing-4         	  100000	     11535 ns/op	     117 B/op	       4 allocs/op
 ```
 
-## Shameless plug
+## See also
 
-Check my [PostgreSQL client for Go](https://github.com/go-pg/pg).
+- [Golang PostgreSQL ORM](https://github.com/go-pg/pg)
+- [Golang msgpack](https://github.com/vmihailenco/msgpack)
+- [Golang message task queue](https://github.com/vmihailenco/taskq)

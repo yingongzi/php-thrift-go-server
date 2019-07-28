@@ -1,0 +1,10 @@
+[ERROR][2019-07-21T20:08:12.709+0800] Service||SetUsers||util.JsonUnmarshalFromString error||users=[{"userID":1,"username":"sunyin01","age":18,"gender":false},{"userID":2,"username":"sunyin02","age":28,"gender":true},{"userID":3,"username":"sunyin03","age":38,"gender":true}]
+[ERROR][2019-07-21T20:08:12.709+0800] Service||GetUserByUserID||redis internal error||userID=1
+[INFO][2019-07-21T20:10:15.756+0800] Service||SetUsers||req={"userInfoStr":"[{\"userID\":1,\"username\":\"sunyin01\",\"age\":18,\"gender\":false},{\"userID\":2,\"username\":\"sunyin02\",\"age\":28,\"gender\":true},{\"userID\":3,\"username\":\"sunyin03\",\"age\":38,\"gender\":true}]"}
+[ERROR][2019-07-21T20:10:15.756+0800] Service||SetUsers||util.JsonUnmarshalFromString error||users=[{"userID":1,"username":"sunyin01","age":18,"gender":false},{"userID":2,"username":"sunyin02","age":28,"gender":true},{"userID":3,"username":"sunyin03","age":38,"gender":true}]
+[INFO][2019-07-21T20:10:15.756+0800] Service||GetUserByUserID||req={"userID":1}
+[ERROR][2019-07-21T20:10:15.756+0800] Service||GetUserByUserID||redis internal error||userID=1
+[INFO][2019-07-21T20:11:59.499+0800] Service||SetUsers||req={"userInfoStr":"[{\"userID\":1,\"username\":\"sunyin01\",\"age\":18,\"gender\":false},{\"userID\":2,\"username\":\"sunyin02\",\"age\":28,\"gender\":true},{\"userID\":3,\"username\":\"sunyin03\",\"age\":38,\"gender\":true}]"}
+[INFO][2019-07-21T20:11:59.500+0800] Service||GetUserByUserID||req={"userID":1}
+[INFO][2019-07-21T20:21:31.293+0800] Service||SetUsers||req={"userInfoStr":"[{\"userID\":1,\"username\":\"sunyin01\",\"age\":18,\"gender\":false},{\"userID\":2,\"username\":\"sunyin02\",\"age\":28,\"gender\":true},{\"userID\":3,\"username\":\"sunyin03\",\"age\":38,\"gender\":true}]"}
+[INFO][2019-07-21T20:21:31.294+0800] Service||GetUserByUserID||req={"userID":1}

@@ -2,41 +2,10 @@ package proto_test
 
 import (
 	"bytes"
-	"strings"
 	"testing"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
-	"gopkg.in/redis.v5/internal/proto"
+	"github.com/go-redis/redis/internal/proto"
 )
-
-var _ = Describe("Reader", func() {
-
-	It("should read n bytes", func() {
-		data, err := proto.NewReader(strings.NewReader("ABCDEFGHIJKLMNO")).ReadN(10)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(len(data)).To(Equal(10))
-		Expect(string(data)).To(Equal("ABCDEFGHIJ"))
-
-		data, err = proto.NewReader(strings.NewReader(strings.Repeat("x", 8192))).ReadN(6000)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(len(data)).To(Equal(6000))
-	})
-
-	It("should read lines", func() {
-		p := proto.NewReader(strings.NewReader("$5\r\nhello\r\n"))
-
-		data, err := p.ReadLine()
-		Expect(err).NotTo(HaveOccurred())
-		Expect(string(data)).To(Equal("$5"))
-
-		data, err = p.ReadLine()
-		Expect(err).NotTo(HaveOccurred())
-		Expect(string(data)).To(Equal("hello"))
-	})
-
-})
 
 func BenchmarkReader_ParseReply_Status(b *testing.B) {
 	benchmarkParseReply(b, "+OK\r\n", nil, false)
@@ -59,7 +28,7 @@ func BenchmarkReader_ParseReply_Slice(b *testing.B) {
 }
 
 func benchmarkParseReply(b *testing.B, reply string, m proto.MultiBulkParse, wanterr bool) {
-	buf := &bytes.Buffer{}
+	buf := new(bytes.Buffer)
 	for i := 0; i < b.N; i++ {
 		buf.WriteString(reply)
 	}

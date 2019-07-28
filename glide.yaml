@@ -1,7 +1,7 @@
 package: php-thrift-go-server
 import:
   - package: github.com/go-redis/redis
-    version: v5.0.0
+    version: v6.15.3
   - package: github.com/yingongzi/php-thrift
     version: rebuild
   - package: github.com/sirupsen/logrus
@@ -16,4 +16,9 @@ import:
     version: 1.0.1
   - package: github.com/modern-go/concurrent
     version: 1.0.1
+  - package: git.apache.org/thrift.git/lib/go/thrift
+    version: 0.10.0
+  - package: gopkg.in/redis.v5/internal/consistenthash
+  - package: git.xiaojukeji.com/soda-framework/go-log
+  - package: git.xiaojukeji.com/soda-framework/go-trace
 

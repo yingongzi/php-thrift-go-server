@@ -1,0 +1,4 @@
+[ERROR][2019-07-21T20:08:12.709+0800] Service||SetUsers||util.JsonUnmarshalFromString error||users=[{"userID":1,"username":"sunyin01","age":18,"gender":false},{"userID":2,"username":"sunyin02","age":28,"gender":true},{"userID":3,"username":"sunyin03","age":38,"gender":true}]
+[ERROR][2019-07-21T20:08:12.709+0800] Service||GetUserByUserID||redis internal error||userID=1
+[ERROR][2019-07-21T20:10:15.756+0800] Service||SetUsers||util.JsonUnmarshalFromString error||users=[{"userID":1,"username":"sunyin01","age":18,"gender":false},{"userID":2,"username":"sunyin02","age":28,"gender":true},{"userID":3,"username":"sunyin03","age":38,"gender":true}]
+[ERROR][2019-07-21T20:10:15.756+0800] Service||GetUserByUserID||redis internal error||userID=1

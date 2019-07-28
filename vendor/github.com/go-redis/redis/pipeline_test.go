@@ -1,70 +1,28 @@
 package redis_test
 
 import (
-	"strconv"
-	"sync"
+	"github.com/go-redis/redis"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-
-	"gopkg.in/redis.v5"
 )
 
-var _ = Describe("Pipelining", func() {
+var _ = Describe("pipelining", func() {
 	var client *redis.Client
+	var pipe *redis.Pipeline
 
 	BeforeEach(func() {
 		client = redis.NewClient(redisOptions())
-		Expect(client.FlushDb().Err()).NotTo(HaveOccurred())
+		Expect(client.FlushDB().Err()).NotTo(HaveOccurred())
 	})
 
 	AfterEach(func() {
 		Expect(client.Close()).NotTo(HaveOccurred())
 	})
 
-	It("should pipeline", func() {
-		set := client.Set("key2", "hello2", 0)
-		Expect(set.Err()).NotTo(HaveOccurred())
-		Expect(set.Val()).To(Equal("OK"))
-
-		pipeline := client.Pipeline()
-		set = pipeline.Set("key1", "hello1", 0)
-		get := pipeline.Get("key2")
-		incr := pipeline.Incr("key3")
-		getNil := pipeline.Get("key4")
-
-		cmds, err := pipeline.Exec()
-		Expect(err).To(Equal(redis.Nil))
-		Expect(cmds).To(HaveLen(4))
-		Expect(pipeline.Close()).NotTo(HaveOccurred())
-
-		Expect(set.Err()).NotTo(HaveOccurred())
-		Expect(set.Val()).To(Equal("OK"))
-
-		Expect(get.Err()).NotTo(HaveOccurred())
-		Expect(get.Val()).To(Equal("hello2"))
-
-		Expect(incr.Err()).NotTo(HaveOccurred())
-		Expect(incr.Val()).To(Equal(int64(1)))
-
-		Expect(getNil.Err()).To(Equal(redis.Nil))
-		Expect(getNil.Val()).To(Equal(""))
-	})
-
-	It("should discard", func() {
-		pipeline := client.Pipeline()
-
-		pipeline.Get("key")
-		pipeline.Discard()
-		cmds, err := pipeline.Exec()
-		Expect(err).NotTo(HaveOccurred())
-		Expect(cmds).To(HaveLen(0))
-		Expect(pipeline.Close()).NotTo(HaveOccurred())
-	})
-
-	It("should support block style", func() {
+	It("supports block style", func() {
 		var get *redis.StringCmd
-		cmds, err := client.Pipelined(func(pipe *redis.Pipeline) error {
+		cmds, err := client.Pipelined(func(pipe redis.Pipeliner) error {
 			get = pipe.Get("foo")
 			return nil
 		})
@@ -75,100 +33,55 @@ var _ = Describe("Pipelining", func() {
 		Expect(get.Val()).To(Equal(""))
 	})
 
-	It("should handle vals/err", func() {
-		pipeline := client.Pipeline()
+	assertPipeline := func() {
+		It("returns no errors when there are no commands", func() {
+			_, err := pipe.Exec()
+			Expect(err).NotTo(HaveOccurred())
+		})
 
-		get := pipeline.Get("key")
-		Expect(get.Err()).NotTo(HaveOccurred())
-		Expect(get.Val()).To(Equal(""))
-		Expect(pipeline.Close()).NotTo(HaveOccurred())
+		It("discards queued commands", func() {
+			pipe.Get("key")
+			pipe.Discard()
+			cmds, err := pipe.Exec()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cmds).To(BeNil())
+		})
+
+		It("handles val/err", func() {
+			err := client.Set("key", "value", 0).Err()
+			Expect(err).NotTo(HaveOccurred())
+
+			get := pipe.Get("key")
+			cmds, err := pipe.Exec()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cmds).To(HaveLen(1))
+
+			val, err := get.Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(val).To(Equal("value"))
+		})
+
+		It("supports custom command", func() {
+			pipe.Do("ping")
+			cmds, err := pipe.Exec()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cmds).To(HaveLen(1))
+		})
+	}
+
+	Describe("Pipeline", func() {
+		BeforeEach(func() {
+			pipe = client.Pipeline().(*redis.Pipeline)
+		})
+
+		assertPipeline()
 	})
 
-	It("should pipeline with empty queue", func() {
-		pipeline := client.Pipeline()
-		cmds, err := pipeline.Exec()
-		Expect(err).NotTo(HaveOccurred())
-		Expect(cmds).To(HaveLen(0))
-		Expect(pipeline.Close()).NotTo(HaveOccurred())
+	Describe("TxPipeline", func() {
+		BeforeEach(func() {
+			pipe = client.TxPipeline().(*redis.Pipeline)
+		})
+
+		assertPipeline()
 	})
-
-	It("should increment correctly", func() {
-		const N = 20000
-		key := "TestPipelineIncr"
-		pipeline := client.Pipeline()
-		for i := 0; i < N; i++ {
-			pipeline.Incr(key)
-		}
-
-		cmds, err := pipeline.Exec()
-		Expect(err).NotTo(HaveOccurred())
-		Expect(pipeline.Close()).NotTo(HaveOccurred())
-
-		Expect(len(cmds)).To(Equal(20000))
-		for _, cmd := range cmds {
-			Expect(cmd.Err()).NotTo(HaveOccurred())
-		}
-
-		get := client.Get(key)
-		Expect(get.Err()).NotTo(HaveOccurred())
-		Expect(get.Val()).To(Equal(strconv.Itoa(N)))
-	})
-
-	It("should PipelineEcho", func() {
-		const N = 1000
-
-		wg := &sync.WaitGroup{}
-		wg.Add(N)
-		for i := 0; i < N; i++ {
-			go func(i int) {
-				defer GinkgoRecover()
-				defer wg.Done()
-
-				pipeline := client.Pipeline()
-
-				msg1 := "echo" + strconv.Itoa(i)
-				msg2 := "echo" + strconv.Itoa(i+1)
-
-				echo1 := pipeline.Echo(msg1)
-				echo2 := pipeline.Echo(msg2)
-
-				cmds, err := pipeline.Exec()
-				Expect(err).NotTo(HaveOccurred())
-				Expect(cmds).To(HaveLen(2))
-
-				Expect(echo1.Err()).NotTo(HaveOccurred())
-				Expect(echo1.Val()).To(Equal(msg1))
-
-				Expect(echo2.Err()).NotTo(HaveOccurred())
-				Expect(echo2.Val()).To(Equal(msg2))
-
-				Expect(pipeline.Close()).NotTo(HaveOccurred())
-			}(i)
-		}
-		wg.Wait()
-	})
-
-	It("should be thread-safe", func() {
-		const N = 1000
-
-		pipeline := client.Pipeline()
-		wg := &sync.WaitGroup{}
-		wg.Add(N)
-		for i := 0; i < N; i++ {
-			go func() {
-				defer GinkgoRecover()
-
-				pipeline.Ping()
-				wg.Done()
-			}()
-		}
-		wg.Wait()
-
-		cmds, err := pipeline.Exec()
-		Expect(err).NotTo(HaveOccurred())
-		Expect(cmds).To(HaveLen(N))
-
-		Expect(pipeline.Close()).NotTo(HaveOccurred())
-	})
-
 })

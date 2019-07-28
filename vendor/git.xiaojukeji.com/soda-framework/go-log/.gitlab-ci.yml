@@ -1,0 +1,9 @@
+doc:
+  stage: build
+  only:
+    - master
+  tags:
+    - soda
+  allow_failure: false
+  script:
+    - godocwiki .

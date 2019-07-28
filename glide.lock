@@ -1,10 +1,33 @@
-hash: 67977bbb644b50935bb5e9a60bf64488cd25c58c721e31136a1791e1d43f9e9a
-updated: 2019-07-21T13:28:27.983243+08:00
+hash: a0a10e21c5aeec686c70f2c6b5b2c89ba998fc78637e6b0ae72a142e3b0c1558
+updated: 2019-07-21T19:14:50.910912+08:00
 imports:
+- name: git.apache.org/thrift.git
+  version: b2a4d4ae21c789b689dd162deb819665567f481c
+  subpackages:
+  - lib/go/thrift
+- name: git.xiaojukeji.com/soda-framework/go-log
+  version: 52681ac96f9af8f7aef4dfc1060c3c914ce8003f
+  subpackages:
+  - internal/lumberjack
+- name: git.xiaojukeji.com/soda-framework/go-timer
+  version: 2cfa5c32a66824e40e4be97098b33368087a5faf
+- name: git.xiaojukeji.com/soda-framework/go-trace
+  version: 4a1f5062850dd36c2d7edf3639bbe946ae0ffbbf
 - name: github.com/go-redis/redis
-  version: 6f8957c5b7dece15d1ea5f592ec88f46ee2deffa
+  version: 75795aa4236dc7341eefac3bbe945e68c99ef9df
+  subpackages:
+  - internal
+  - internal/consistenthash
+  - internal/hashtag
+  - internal/pool
+  - internal/proto
+  - internal/util
 - name: github.com/json-iterator/go
   version: 1624edc4454b8682399def8740d46db5e4362ba4
+- name: github.com/modern-go/concurrent
+  version: b889e4d97c66647327c9ee06ac249673a997db5f
+- name: github.com/modern-go/reflect2
+  version: 4b7aa43c6742a2c18fdef89dd197aaae7dac7ccd
 - name: github.com/pelletier/go-buffruneio
   version: c37440a7cf42ac63b919c752ca73a85067e05992
 - name: github.com/pelletier/go-toml
@@ -13,4 +36,10 @@ imports:
   version: 839c75faf7f98a33d445d181f3018b5c3409a45e
 - name: github.com/yingongzi/php-thrift
   version: ebe4bc2c510cc1a0124179d65770ec5b587a71d2
+  subpackages:
+  - gen-go/php_go/idl
+- name: gopkg.in/redis.v5
+  version: a16aeec10ff407b1e7be6dd35797ccf5426ef0f0
+  subpackages:
+  - internal/consistenthash
 testImports: []

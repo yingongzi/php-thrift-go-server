@@ -1,20 +1,20 @@
 package redis_test
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
-
 	"testing"
 	"time"
 
+	"github.com/go-redis/redis"
+	"github.com/go-redis/redis/internal/hashtag"
+
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-
-	"gopkg.in/redis.v5"
-	"gopkg.in/redis.v5/internal/hashtag"
 )
 
 type clusterScenario struct {
@@ -22,10 +22,6 @@ type clusterScenario struct {
 	nodeIds   []string
 	processes map[string]*redisProcess
 	clients   map[string]*redis.Client
-}
-
-func (s *clusterScenario) primary() *redis.Client {
-	return s.clients[s.ports[0]]
 }
 
 func (s *clusterScenario) masters() []*redis.Client {
@@ -44,13 +40,44 @@ func (s *clusterScenario) slaves() []*redis.Client {
 	return result
 }
 
-func (s *clusterScenario) clusterClient(opt *redis.ClusterOptions) *redis.ClusterClient {
+func (s *clusterScenario) addrs() []string {
 	addrs := make([]string, len(s.ports))
 	for i, port := range s.ports {
 		addrs[i] = net.JoinHostPort("127.0.0.1", port)
 	}
-	opt.Addrs = addrs
+	return addrs
+}
+
+func (s *clusterScenario) clusterClientUnsafe(opt *redis.ClusterOptions) *redis.ClusterClient {
+	opt.Addrs = s.addrs()
 	return redis.NewClusterClient(opt)
+
+}
+
+func (s *clusterScenario) clusterClient(opt *redis.ClusterOptions) *redis.ClusterClient {
+	client := s.clusterClientUnsafe(opt)
+
+	err := eventually(func() error {
+		if opt.ClusterSlots != nil {
+			return nil
+		}
+
+		state, err := client.LoadState()
+		if err != nil {
+			return err
+		}
+
+		if !state.IsConsistent() {
+			return fmt.Errorf("cluster state is not consistent")
+		}
+
+		return nil
+	}, 30*time.Second)
+	if err != nil {
+		panic(err)
+	}
+
+	return client
 }
 
 func startCluster(scenario *clusterScenario) error {
@@ -75,7 +102,7 @@ func startCluster(scenario *clusterScenario) error {
 		scenario.nodeIds[pos] = info[:40]
 	}
 
-	// Meet cluster nodes
+	// Meet cluster nodes.
 	for _, client := range scenario.clients {
 		err := client.ClusterMeet("127.0.0.1", scenario.ports[0]).Err()
 		if err != nil {
@@ -83,7 +110,7 @@ func startCluster(scenario *clusterScenario) error {
 		}
 	}
 
-	// Bootstrap masters
+	// Bootstrap masters.
 	slots := []int{0, 5000, 10000, 16384}
 	for pos, master := range scenario.masters() {
 		err := master.ClusterAddSlotsRange(slots[pos], slots[pos+1]-1).Err()
@@ -92,7 +119,7 @@ func startCluster(scenario *clusterScenario) error {
 		}
 	}
 
-	// Bootstrap slaves
+	// Bootstrap slaves.
 	for idx, slave := range scenario.slaves() {
 		masterId := scenario.nodeIds[idx]
 
@@ -115,17 +142,43 @@ func startCluster(scenario *clusterScenario) error {
 		}
 	}
 
-	// Wait until all nodes have consistent info
+	// Wait until all nodes have consistent info.
+	wanted := []redis.ClusterSlot{{
+		Start: 0,
+		End:   4999,
+		Nodes: []redis.ClusterNode{{
+			Id:   "",
+			Addr: "127.0.0.1:8220",
+		}, {
+			Id:   "",
+			Addr: "127.0.0.1:8223",
+		}},
+	}, {
+		Start: 5000,
+		End:   9999,
+		Nodes: []redis.ClusterNode{{
+			Id:   "",
+			Addr: "127.0.0.1:8221",
+		}, {
+			Id:   "",
+			Addr: "127.0.0.1:8224",
+		}},
+	}, {
+		Start: 10000,
+		End:   16383,
+		Nodes: []redis.ClusterNode{{
+			Id:   "",
+			Addr: "127.0.0.1:8222",
+		}, {
+			Id:   "",
+			Addr: "127.0.0.1:8225",
+		}},
+	}}
 	for _, client := range scenario.clients {
 		err := eventually(func() error {
 			res, err := client.ClusterSlots().Result()
 			if err != nil {
 				return err
-			}
-			wanted := []redis.ClusterSlot{
-				{0, 4999, []redis.ClusterNode{{"", "127.0.0.1:8220"}, {"", "127.0.0.1:8223"}}},
-				{5000, 9999, []redis.ClusterNode{{"", "127.0.0.1:8221"}, {"", "127.0.0.1:8224"}}},
-				{10000, 16383, []redis.ClusterNode{{"", "127.0.0.1:8222"}, {"", "127.0.0.1:8225"}}},
 			}
 			return assertSlotsEqual(res, wanted)
 		}, 30*time.Second)
@@ -138,11 +191,11 @@ func startCluster(scenario *clusterScenario) error {
 }
 
 func assertSlotsEqual(slots, wanted []redis.ClusterSlot) error {
-outer_loop:
+outerLoop:
 	for _, s2 := range wanted {
 		for _, s1 := range slots {
 			if slotEqual(s1, s2) {
-				continue outer_loop
+				continue outerLoop
 			}
 		}
 		return fmt.Errorf("%v not found in %v", s2, slots)
@@ -155,6 +208,9 @@ func slotEqual(s1, s2 redis.ClusterSlot) bool {
 		return false
 	}
 	if s1.End != s2.End {
+		return false
+	}
+	if len(s1.Nodes) != len(s2.Nodes) {
 		return false
 	}
 	for i, n1 := range s1.Nodes {
@@ -182,19 +238,392 @@ func stopCluster(scenario *clusterScenario) error {
 //------------------------------------------------------------------------------
 
 var _ = Describe("ClusterClient", func() {
+	var failover bool
+	var opt *redis.ClusterOptions
 	var client *redis.ClusterClient
 
-	describeClusterClient := func() {
+	assertClusterClient := func() {
+		It("should GET/SET/DEL", func() {
+			err := client.Get("A").Err()
+			Expect(err).To(Equal(redis.Nil))
+
+			err = client.Set("A", "VALUE", 0).Err()
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(func() string {
+				return client.Get("A").Val()
+			}, 30*time.Second).Should(Equal("VALUE"))
+
+			cnt, err := client.Del("A").Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(cnt).To(Equal(int64(1)))
+		})
+
+		It("GET follows redirects", func() {
+			err := client.Set("A", "VALUE", 0).Err()
+			Expect(err).NotTo(HaveOccurred())
+
+			if !failover {
+				Eventually(func() int64 {
+					nodes, err := client.Nodes("A")
+					if err != nil {
+						return 0
+					}
+					return nodes[1].Client.DBSize().Val()
+				}, 30*time.Second).Should(Equal(int64(1)))
+
+				Eventually(func() error {
+					return client.SwapNodes("A")
+				}, 30*time.Second).ShouldNot(HaveOccurred())
+			}
+
+			v, err := client.Get("A").Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(v).To(Equal("VALUE"))
+		})
+
+		It("SET follows redirects", func() {
+			if !failover {
+				Eventually(func() error {
+					return client.SwapNodes("A")
+				}, 30*time.Second).ShouldNot(HaveOccurred())
+			}
+
+			err := client.Set("A", "VALUE", 0).Err()
+			Expect(err).NotTo(HaveOccurred())
+
+			v, err := client.Get("A").Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(v).To(Equal("VALUE"))
+		})
+
+		It("distributes keys", func() {
+			for i := 0; i < 100; i++ {
+				err := client.Set(fmt.Sprintf("key%d", i), "value", 0).Err()
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			client.ForEachMaster(func(master *redis.Client) error {
+				defer GinkgoRecover()
+				Eventually(func() string {
+					return master.Info("keyspace").Val()
+				}, 30*time.Second).Should(Or(
+					ContainSubstring("keys=31"),
+					ContainSubstring("keys=29"),
+					ContainSubstring("keys=40"),
+				))
+				return nil
+			})
+		})
+
+		It("distributes keys when using EVAL", func() {
+			script := redis.NewScript(`
+				local r = redis.call('SET', KEYS[1], ARGV[1])
+				return r
+			`)
+
+			var key string
+			for i := 0; i < 100; i++ {
+				key = fmt.Sprintf("key%d", i)
+				err := script.Run(client, []string{key}, "value").Err()
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			client.ForEachMaster(func(master *redis.Client) error {
+				defer GinkgoRecover()
+				Eventually(func() string {
+					return master.Info("keyspace").Val()
+				}, 30*time.Second).Should(Or(
+					ContainSubstring("keys=31"),
+					ContainSubstring("keys=29"),
+					ContainSubstring("keys=40"),
+				))
+				return nil
+			})
+		})
+
+		It("supports Watch", func() {
+			var incr func(string) error
+
+			// Transactionally increments key using GET and SET commands.
+			incr = func(key string) error {
+				err := client.Watch(func(tx *redis.Tx) error {
+					n, err := tx.Get(key).Int64()
+					if err != nil && err != redis.Nil {
+						return err
+					}
+
+					_, err = tx.Pipelined(func(pipe redis.Pipeliner) error {
+						pipe.Set(key, strconv.FormatInt(n+1, 10), 0)
+						return nil
+					})
+					return err
+				}, key)
+				if err == redis.TxFailedErr {
+					return incr(key)
+				}
+				return err
+			}
+
+			var wg sync.WaitGroup
+			for i := 0; i < 100; i++ {
+				wg.Add(1)
+				go func() {
+					defer GinkgoRecover()
+					defer wg.Done()
+
+					err := incr("key")
+					Expect(err).NotTo(HaveOccurred())
+				}()
+			}
+			wg.Wait()
+
+			Eventually(func() string {
+				return client.Get("key").Val()
+			}, 30*time.Second).Should(Equal("100"))
+		})
+
+		Describe("pipelining", func() {
+			var pipe *redis.Pipeline
+
+			assertPipeline := func() {
+				keys := []string{"A", "B", "C", "D", "E", "F", "G"}
+
+				It("follows redirects", func() {
+					if !failover {
+						for _, key := range keys {
+							Eventually(func() error {
+								return client.SwapNodes(key)
+							}, 30*time.Second).ShouldNot(HaveOccurred())
+						}
+					}
+
+					for i, key := range keys {
+						pipe.Set(key, key+"_value", 0)
+						pipe.Expire(key, time.Duration(i+1)*time.Hour)
+					}
+					cmds, err := pipe.Exec()
+					Expect(err).NotTo(HaveOccurred())
+					Expect(cmds).To(HaveLen(14))
+
+					_ = client.ForEachNode(func(node *redis.Client) error {
+						defer GinkgoRecover()
+						Eventually(func() int64 {
+							return node.DBSize().Val()
+						}, 30*time.Second).ShouldNot(BeZero())
+						return nil
+					})
+
+					if !failover {
+						for _, key := range keys {
+							Eventually(func() error {
+								return client.SwapNodes(key)
+							}, 30*time.Second).ShouldNot(HaveOccurred())
+						}
+					}
+
+					for _, key := range keys {
+						pipe.Get(key)
+						pipe.TTL(key)
+					}
+					cmds, err = pipe.Exec()
+					Expect(err).NotTo(HaveOccurred())
+					Expect(cmds).To(HaveLen(14))
+
+					for i, key := range keys {
+						get := cmds[i*2].(*redis.StringCmd)
+						Expect(get.Val()).To(Equal(key + "_value"))
+
+						ttl := cmds[(i*2)+1].(*redis.DurationCmd)
+						dur := time.Duration(i+1) * time.Hour
+						Expect(ttl.Val()).To(BeNumerically("~", dur, 30*time.Second))
+					}
+				})
+
+				It("works with missing keys", func() {
+					pipe.Set("A", "A_value", 0)
+					pipe.Set("C", "C_value", 0)
+					_, err := pipe.Exec()
+					Expect(err).NotTo(HaveOccurred())
+
+					a := pipe.Get("A")
+					b := pipe.Get("B")
+					c := pipe.Get("C")
+					cmds, err := pipe.Exec()
+					Expect(err).To(Equal(redis.Nil))
+					Expect(cmds).To(HaveLen(3))
+
+					Expect(a.Err()).NotTo(HaveOccurred())
+					Expect(a.Val()).To(Equal("A_value"))
+
+					Expect(b.Err()).To(Equal(redis.Nil))
+					Expect(b.Val()).To(Equal(""))
+
+					Expect(c.Err()).NotTo(HaveOccurred())
+					Expect(c.Val()).To(Equal("C_value"))
+				})
+			}
+
+			Describe("with Pipeline", func() {
+				BeforeEach(func() {
+					pipe = client.Pipeline().(*redis.Pipeline)
+				})
+
+				AfterEach(func() {
+					Expect(pipe.Close()).NotTo(HaveOccurred())
+				})
+
+				assertPipeline()
+			})
+
+			Describe("with TxPipeline", func() {
+				BeforeEach(func() {
+					pipe = client.TxPipeline().(*redis.Pipeline)
+				})
+
+				AfterEach(func() {
+					Expect(pipe.Close()).NotTo(HaveOccurred())
+				})
+
+				assertPipeline()
+			})
+		})
+
+		It("supports PubSub", func() {
+			pubsub := client.Subscribe("mychannel")
+			defer pubsub.Close()
+
+			Eventually(func() error {
+				_, err := client.Publish("mychannel", "hello").Result()
+				if err != nil {
+					return err
+				}
+
+				msg, err := pubsub.ReceiveTimeout(time.Second)
+				if err != nil {
+					return err
+				}
+
+				_, ok := msg.(*redis.Message)
+				if !ok {
+					return fmt.Errorf("got %T, wanted *redis.Message", msg)
+				}
+
+				return nil
+			}, 30*time.Second).ShouldNot(HaveOccurred())
+		})
+
+		It("supports PubSub.Ping without channels", func() {
+			pubsub := client.Subscribe()
+			defer pubsub.Close()
+
+			err := pubsub.Ping()
+			Expect(err).NotTo(HaveOccurred())
+		})
+	}
+
+	Describe("ClusterClient", func() {
+		BeforeEach(func() {
+			opt = redisClusterOptions()
+			client = cluster.clusterClient(opt)
+
+			err := client.ForEachMaster(func(master *redis.Client) error {
+				return master.FlushDB().Err()
+			})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		AfterEach(func() {
+			_ = client.ForEachMaster(func(master *redis.Client) error {
+				return master.FlushDB().Err()
+			})
+			Expect(client.Close()).NotTo(HaveOccurred())
+		})
+
+		It("returns pool stats", func() {
+			stats := client.PoolStats()
+			Expect(stats).To(BeAssignableToTypeOf(&redis.PoolStats{}))
+		})
+
+		It("removes idle connections", func() {
+			stats := client.PoolStats()
+			Expect(stats.TotalConns).NotTo(BeZero())
+			Expect(stats.IdleConns).NotTo(BeZero())
+
+			time.Sleep(2 * time.Second)
+
+			stats = client.PoolStats()
+			Expect(stats.TotalConns).To(BeZero())
+			Expect(stats.IdleConns).To(BeZero())
+		})
+
+		It("returns an error when there are no attempts left", func() {
+			opt := redisClusterOptions()
+			opt.MaxRedirects = -1
+			client := cluster.clusterClient(opt)
+
+			Eventually(func() error {
+				return client.SwapNodes("A")
+			}, 30*time.Second).ShouldNot(HaveOccurred())
+
+			err := client.Get("A").Err()
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("MOVED"))
+
+			Expect(client.Close()).NotTo(HaveOccurred())
+		})
+
+		It("calls fn for every master node", func() {
+			for i := 0; i < 10; i++ {
+				Expect(client.Set(strconv.Itoa(i), "", 0).Err()).NotTo(HaveOccurred())
+			}
+
+			err := client.ForEachMaster(func(master *redis.Client) error {
+				return master.FlushDB().Err()
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			size, err := client.DBSize().Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(size).To(Equal(int64(0)))
+		})
+
 		It("should CLUSTER SLOTS", func() {
 			res, err := client.ClusterSlots().Result()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(res).To(HaveLen(3))
 
-			wanted := []redis.ClusterSlot{
-				{0, 4999, []redis.ClusterNode{{"", "127.0.0.1:8220"}, {"", "127.0.0.1:8223"}}},
-				{5000, 9999, []redis.ClusterNode{{"", "127.0.0.1:8221"}, {"", "127.0.0.1:8224"}}},
-				{10000, 16383, []redis.ClusterNode{{"", "127.0.0.1:8222"}, {"", "127.0.0.1:8225"}}},
-			}
+			wanted := []redis.ClusterSlot{{
+				Start: 0,
+				End:   4999,
+				Nodes: []redis.ClusterNode{{
+					Id:   "",
+					Addr: "127.0.0.1:8220",
+				}, {
+					Id:   "",
+					Addr: "127.0.0.1:8223",
+				}},
+			}, {
+				Start: 5000,
+				End:   9999,
+				Nodes: []redis.ClusterNode{{
+					Id:   "",
+					Addr: "127.0.0.1:8221",
+				}, {
+					Id:   "",
+					Addr: "127.0.0.1:8224",
+				}},
+			}, {
+				Start: 10000,
+				End:   16383,
+				Nodes: []redis.ClusterNode{{
+					Id:   "",
+					Addr: "127.0.0.1:8222",
+				}, {
+					Id:   "",
+					Addr: "127.0.0.1:8225",
+				}},
+			}}
 			Expect(assertSlotsEqual(res, wanted)).NotTo(HaveOccurred())
 		})
 
@@ -214,6 +643,12 @@ var _ = Describe("ClusterClient", func() {
 			hashSlot, err := client.ClusterKeySlot("somekey").Result()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(hashSlot).To(Equal(int64(hashtag.Slot("somekey"))))
+		})
+
+		It("should CLUSTER GETKEYSINSLOT", func() {
+			keys, err := client.ClusterGetKeysInSlot(hashtag.Slot("somekey"), 1).Result()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(len(keys)).To(Equal(0))
 		})
 
 		It("should CLUSTER COUNT-FAILURE-REPORTS", func() {
@@ -241,304 +676,402 @@ var _ = Describe("ClusterClient", func() {
 			Expect(nodesList).Should(HaveLen(1))
 		})
 
-		It("should GET/SET/DEL", func() {
-			val, err := client.Get("A").Result()
-			Expect(err).To(Equal(redis.Nil))
-			Expect(val).To(Equal(""))
+		It("should RANDOMKEY", func() {
+			const nkeys = 100
 
-			val, err = client.Set("A", "VALUE", 0).Result()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(val).To(Equal("OK"))
-
-			val, err = client.Get("A").Result()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(val).To(Equal("VALUE"))
-
-			cnt, err := client.Del("A").Result()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(cnt).To(Equal(int64(1)))
-		})
-
-		It("returns pool stats", func() {
-			Expect(client.PoolStats()).To(BeAssignableToTypeOf(&redis.PoolStats{}))
-		})
-
-		It("removes idle connections", func() {
-			stats := client.PoolStats()
-			Expect(stats.TotalConns).NotTo(BeZero())
-			Expect(stats.FreeConns).NotTo(BeZero())
-
-			time.Sleep(2 * time.Second)
-
-			stats = client.PoolStats()
-			Expect(stats.TotalConns).To(BeZero())
-			Expect(stats.FreeConns).To(BeZero())
-		})
-
-		It("follows redirects", func() {
-			Expect(client.Set("A", "VALUE", 0).Err()).NotTo(HaveOccurred())
-
-			slot := hashtag.Slot("A")
-			Expect(client.SwapSlotNodes(slot)).To(Equal([]string{"127.0.0.1:8224", "127.0.0.1:8221"}))
-
-			val, err := client.Get("A").Result()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(val).To(Equal("VALUE"))
-		})
-
-		It("returns an error when there are no attempts left", func() {
-			opt := redisClusterOptions()
-			opt.MaxRedirects = -1
-			client := cluster.clusterClient(opt)
-
-			slot := hashtag.Slot("A")
-			Expect(client.SwapSlotNodes(slot)).To(Equal([]string{"127.0.0.1:8224", "127.0.0.1:8221"}))
-
-			err := client.Get("A").Err()
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("MOVED"))
-
-			Expect(client.Close()).NotTo(HaveOccurred())
-		})
-
-		It("distributes keys", func() {
-			for i := 0; i < 100; i++ {
+			for i := 0; i < nkeys; i++ {
 				err := client.Set(fmt.Sprintf("key%d", i), "value", 0).Err()
 				Expect(err).NotTo(HaveOccurred())
 			}
 
-			wanted := []string{"keys=31", "keys=29", "keys=40"}
-			for i, master := range cluster.masters() {
-				Expect(master.Info().Val()).To(ContainSubstring(wanted[i]))
-			}
-		})
-
-		It("distributes keys when using EVAL", func() {
-			script := redis.NewScript(`
-				local r = redis.call('SET', KEYS[1], ARGV[1])
-				return r
-			`)
-
-			var key string
-			for i := 0; i < 100; i++ {
-				key = fmt.Sprintf("key%d", i)
-				err := script.Run(client, []string{key}, "value").Err()
-				Expect(err).NotTo(HaveOccurred())
-			}
-
-			wanted := []string{"keys=31", "keys=29", "keys=40"}
-			for i, master := range cluster.masters() {
-				Expect(master.Info().Val()).To(ContainSubstring(wanted[i]))
-			}
-		})
-
-		It("supports Watch", func() {
-			var incr func(string) error
-
-			// Transactionally increments key using GET and SET commands.
-			incr = func(key string) error {
-				err := client.Watch(func(tx *redis.Tx) error {
-					n, err := tx.Get(key).Int64()
-					if err != nil && err != redis.Nil {
-						return err
+			var keys []string
+			addKey := func(key string) {
+				for _, k := range keys {
+					if k == key {
+						return
 					}
-
-					_, err = tx.Pipelined(func(pipe *redis.Pipeline) error {
-						pipe.Set(key, strconv.FormatInt(n+1, 10), 0)
-						return nil
-					})
-					return err
-				}, key)
-				if err == redis.TxFailedErr {
-					return incr(key)
 				}
-				return err
+				keys = append(keys, key)
 			}
 
-			var wg sync.WaitGroup
-			for i := 0; i < 100; i++ {
-				wg.Add(1)
-				go func() {
-					defer GinkgoRecover()
-					defer wg.Done()
-
-					err := incr("key")
-					Expect(err).NotTo(HaveOccurred())
-				}()
+			for i := 0; i < nkeys*10; i++ {
+				key := client.RandomKey().Val()
+				addKey(key)
 			}
-			wg.Wait()
 
-			n, err := client.Get("key").Int64()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(n).To(Equal(int64(100)))
+			Expect(len(keys)).To(BeNumerically("~", nkeys, nkeys/10))
 		})
 
-		Describe("pipeline", func() {
-			It("follows redirects", func() {
-				slot := hashtag.Slot("A")
-				Expect(client.SwapSlotNodes(slot)).To(Equal([]string{"127.0.0.1:8224", "127.0.0.1:8221"}))
+		assertClusterClient()
+	})
 
-				pipe := client.Pipeline()
-				defer pipe.Close()
+	Describe("ClusterClient failover", func() {
+		BeforeEach(func() {
+			failover = true
 
-				keys := []string{"A", "B", "C", "D", "E", "F", "G"}
-
-				for i, key := range keys {
-					pipe.Set(key, key+"_value", 0)
-					pipe.Expire(key, time.Duration(i+1)*time.Hour)
-				}
-				cmds, err := pipe.Exec()
-				Expect(err).NotTo(HaveOccurred())
-				Expect(cmds).To(HaveLen(14))
-
-				for _, key := range keys {
-					pipe.Get(key)
-					pipe.TTL(key)
-				}
-				cmds, err = pipe.Exec()
-				Expect(err).NotTo(HaveOccurred())
-				Expect(cmds).To(HaveLen(14))
-				Expect(cmds[0].(*redis.StringCmd).Val()).To(Equal("A_value"))
-				Expect(cmds[1].(*redis.DurationCmd).Val()).To(BeNumerically("~", 1*time.Hour, time.Second))
-				Expect(cmds[6].(*redis.StringCmd).Val()).To(Equal("D_value"))
-				Expect(cmds[7].(*redis.DurationCmd).Val()).To(BeNumerically("~", 4*time.Hour, time.Second))
-				Expect(cmds[12].(*redis.StringCmd).Val()).To(Equal("G_value"))
-				Expect(cmds[13].(*redis.DurationCmd).Val()).To(BeNumerically("~", 7*time.Hour, time.Second))
-			})
-
-			It("works with missing keys", func() {
-				Expect(client.Set("A", "A_value", 0).Err()).NotTo(HaveOccurred())
-				Expect(client.Set("C", "C_value", 0).Err()).NotTo(HaveOccurred())
-
-				var a, b, c *redis.StringCmd
-				cmds, err := client.Pipelined(func(pipe *redis.Pipeline) error {
-					a = pipe.Get("A")
-					b = pipe.Get("B")
-					c = pipe.Get("C")
-					return nil
-				})
-				Expect(err).To(Equal(redis.Nil))
-				Expect(cmds).To(HaveLen(3))
-
-				Expect(a.Err()).NotTo(HaveOccurred())
-				Expect(a.Val()).To(Equal("A_value"))
-
-				Expect(b.Err()).To(Equal(redis.Nil))
-				Expect(b.Val()).To(Equal(""))
-
-				Expect(c.Err()).NotTo(HaveOccurred())
-				Expect(c.Val()).To(Equal("C_value"))
-			})
-		})
-
-		It("calls fn for every master node", func() {
-			for i := 0; i < 10; i++ {
-				Expect(client.Set(strconv.Itoa(i), "", 0).Err()).NotTo(HaveOccurred())
-			}
+			opt = redisClusterOptions()
+			opt.MinRetryBackoff = 250 * time.Millisecond
+			opt.MaxRetryBackoff = time.Second
+			client = cluster.clusterClient(opt)
 
 			err := client.ForEachMaster(func(master *redis.Client) error {
-				return master.FlushDb().Err()
+				return master.FlushDB().Err()
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			for _, client := range cluster.masters() {
-				keys, err := client.Keys("*").Result()
-				Expect(err).NotTo(HaveOccurred())
-				Expect(keys).To(HaveLen(0))
-			}
-		})
-	}
+			err = client.ForEachSlave(func(slave *redis.Client) error {
+				defer GinkgoRecover()
 
-	Describe("default ClusterClient", func() {
-		BeforeEach(func() {
-			client = cluster.clusterClient(redisClusterOptions())
+				Eventually(func() int64 {
+					return slave.DBSize().Val()
+				}, "30s").Should(Equal(int64(0)))
 
-			_ = client.ForEachMaster(func(master *redis.Client) error {
-				return master.FlushDb().Err()
+				return nil
 			})
+			Expect(err).NotTo(HaveOccurred())
+
+			state, err := client.LoadState()
+			Eventually(func() bool {
+				state, err = client.LoadState()
+				if err != nil {
+					return false
+				}
+				return state.IsConsistent()
+			}, "30s").Should(BeTrue())
+
+			for _, slave := range state.Slaves {
+				err = slave.Client.ClusterFailover().Err()
+				Expect(err).NotTo(HaveOccurred())
+
+				Eventually(func() bool {
+					state, _ := client.LoadState()
+					return state.IsConsistent()
+				}, "30s").Should(BeTrue())
+			}
 		})
 
 		AfterEach(func() {
+			failover = false
 			Expect(client.Close()).NotTo(HaveOccurred())
 		})
 
-		describeClusterClient()
+		assertClusterClient()
 	})
 
 	Describe("ClusterClient with RouteByLatency", func() {
 		BeforeEach(func() {
-			opt := redisClusterOptions()
+			opt = redisClusterOptions()
 			opt.RouteByLatency = true
 			client = cluster.clusterClient(opt)
 
-			_ = client.ForEachMaster(func(master *redis.Client) error {
-				return master.FlushDb().Err()
+			err := client.ForEachMaster(func(master *redis.Client) error {
+				return master.FlushDB().Err()
 			})
+			Expect(err).NotTo(HaveOccurred())
+
+			err = client.ForEachSlave(func(slave *redis.Client) error {
+				Eventually(func() int64 {
+					return client.DBSize().Val()
+				}, 30*time.Second).Should(Equal(int64(0)))
+				return nil
+			})
+			Expect(err).NotTo(HaveOccurred())
 		})
 
 		AfterEach(func() {
-			client.FlushDb()
-			Expect(client.Close()).NotTo(HaveOccurred())
+			err := client.ForEachSlave(func(slave *redis.Client) error {
+				return slave.ReadWrite().Err()
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			err = client.Close()
+			Expect(err).NotTo(HaveOccurred())
 		})
 
-		describeClusterClient()
+		assertClusterClient()
 	})
 
-	Describe("ClusterClient without nodes", func() {
+	Describe("ClusterClient with ClusterSlots", func() {
 		BeforeEach(func() {
-			client = redis.NewClusterClient(&redis.ClusterOptions{})
+			failover = true
+
+			opt = redisClusterOptions()
+			opt.ClusterSlots = func() ([]redis.ClusterSlot, error) {
+				slots := []redis.ClusterSlot{{
+					Start: 0,
+					End:   4999,
+					Nodes: []redis.ClusterNode{{
+						Addr: ":" + ringShard1Port,
+					}},
+				}, {
+					Start: 5000,
+					End:   9999,
+					Nodes: []redis.ClusterNode{{
+						Addr: ":" + ringShard2Port,
+					}},
+				}, {
+					Start: 10000,
+					End:   16383,
+					Nodes: []redis.ClusterNode{{
+						Addr: ":" + ringShard3Port,
+					}},
+				}}
+				return slots, nil
+			}
+			client = cluster.clusterClient(opt)
+
+			err := client.ForEachMaster(func(master *redis.Client) error {
+				return master.FlushDB().Err()
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			err = client.ForEachSlave(func(slave *redis.Client) error {
+				Eventually(func() int64 {
+					return client.DBSize().Val()
+				}, 30*time.Second).Should(Equal(int64(0)))
+				return nil
+			})
+			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("returns an error", func() {
+		AfterEach(func() {
+			failover = false
+
+			err := client.Close()
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		assertClusterClient()
+	})
+
+	Describe("ClusterClient with RouteRandomly and ClusterSlots", func() {
+		BeforeEach(func() {
+			failover = true
+
+			opt = redisClusterOptions()
+			opt.RouteRandomly = true
+			opt.ClusterSlots = func() ([]redis.ClusterSlot, error) {
+				slots := []redis.ClusterSlot{{
+					Start: 0,
+					End:   4999,
+					Nodes: []redis.ClusterNode{{
+						Addr: ":" + ringShard1Port,
+					}},
+				}, {
+					Start: 5000,
+					End:   9999,
+					Nodes: []redis.ClusterNode{{
+						Addr: ":" + ringShard2Port,
+					}},
+				}, {
+					Start: 10000,
+					End:   16383,
+					Nodes: []redis.ClusterNode{{
+						Addr: ":" + ringShard3Port,
+					}},
+				}}
+				return slots, nil
+			}
+			client = cluster.clusterClient(opt)
+
+			err := client.ForEachMaster(func(master *redis.Client) error {
+				return master.FlushDB().Err()
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			err = client.ForEachSlave(func(slave *redis.Client) error {
+				Eventually(func() int64 {
+					return client.DBSize().Val()
+				}, 30*time.Second).Should(Equal(int64(0)))
+				return nil
+			})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		AfterEach(func() {
+			failover = false
+
+			err := client.Close()
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		assertClusterClient()
+	})
+})
+
+var _ = Describe("ClusterClient without nodes", func() {
+	var client *redis.ClusterClient
+
+	BeforeEach(func() {
+		client = redis.NewClusterClient(&redis.ClusterOptions{})
+	})
+
+	AfterEach(func() {
+		Expect(client.Close()).NotTo(HaveOccurred())
+	})
+
+	It("Ping returns an error", func() {
+		err := client.Ping().Err()
+		Expect(err).To(MatchError("redis: cluster has no nodes"))
+	})
+
+	It("pipeline returns an error", func() {
+		_, err := client.Pipelined(func(pipe redis.Pipeliner) error {
+			pipe.Ping()
+			return nil
+		})
+		Expect(err).To(MatchError("redis: cluster has no nodes"))
+	})
+})
+
+var _ = Describe("ClusterClient without valid nodes", func() {
+	var client *redis.ClusterClient
+
+	BeforeEach(func() {
+		client = redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs: []string{redisAddr},
+		})
+	})
+
+	AfterEach(func() {
+		Expect(client.Close()).NotTo(HaveOccurred())
+	})
+
+	It("returns an error", func() {
+		err := client.Ping().Err()
+		Expect(err).To(MatchError("ERR This instance has cluster support disabled"))
+	})
+
+	It("pipeline returns an error", func() {
+		_, err := client.Pipelined(func(pipe redis.Pipeliner) error {
+			pipe.Ping()
+			return nil
+		})
+		Expect(err).To(MatchError("ERR This instance has cluster support disabled"))
+	})
+})
+
+var _ = Describe("ClusterClient with unavailable Cluster", func() {
+	var client *redis.ClusterClient
+
+	BeforeEach(func() {
+		for _, node := range cluster.clients {
+			err := node.ClientPause(5 * time.Second).Err()
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		opt := redisClusterOptions()
+		opt.ReadTimeout = 250 * time.Millisecond
+		opt.WriteTimeout = 250 * time.Millisecond
+		opt.MaxRedirects = 1
+		client = cluster.clusterClientUnsafe(opt)
+	})
+
+	AfterEach(func() {
+		Expect(client.Close()).NotTo(HaveOccurred())
+	})
+
+	It("recovers when Cluster recovers", func() {
+		err := client.Ping().Err()
+		Expect(err).To(HaveOccurred())
+
+		Eventually(func() error {
+			return client.Ping().Err()
+		}, "30s").ShouldNot(HaveOccurred())
+	})
+})
+
+var _ = Describe("ClusterClient timeout", func() {
+	var client *redis.ClusterClient
+
+	AfterEach(func() {
+		_ = client.Close()
+	})
+
+	testTimeout := func() {
+		It("Ping timeouts", func() {
 			err := client.Ping().Err()
-			Expect(err).To(MatchError("redis: cluster has no nodes"))
+			Expect(err).To(HaveOccurred())
+			Expect(err.(net.Error).Timeout()).To(BeTrue())
 		})
 
-		It("pipeline returns an error", func() {
-			_, err := client.Pipelined(func(pipe *redis.Pipeline) error {
+		It("Pipeline timeouts", func() {
+			_, err := client.Pipelined(func(pipe redis.Pipeliner) error {
 				pipe.Ping()
 				return nil
 			})
-			Expect(err).To(MatchError("redis: cluster has no nodes"))
+			Expect(err).To(HaveOccurred())
+			Expect(err.(net.Error).Timeout()).To(BeTrue())
 		})
-	})
 
-	Describe("ClusterClient without valid nodes", func() {
+		It("Tx timeouts", func() {
+			err := client.Watch(func(tx *redis.Tx) error {
+				return tx.Ping().Err()
+			}, "foo")
+			Expect(err).To(HaveOccurred())
+			Expect(err.(net.Error).Timeout()).To(BeTrue())
+		})
+
+		It("Tx Pipeline timeouts", func() {
+			err := client.Watch(func(tx *redis.Tx) error {
+				_, err := tx.Pipelined(func(pipe redis.Pipeliner) error {
+					pipe.Ping()
+					return nil
+				})
+				return err
+			}, "foo")
+			Expect(err).To(HaveOccurred())
+			Expect(err.(net.Error).Timeout()).To(BeTrue())
+		})
+	}
+
+	const pause = 5 * time.Second
+
+	Context("read/write timeout", func() {
 		BeforeEach(func() {
-			client = redis.NewClusterClient(&redis.ClusterOptions{
-				Addrs: []string{redisAddr},
+			opt := redisClusterOptions()
+			opt.ReadTimeout = 250 * time.Millisecond
+			opt.WriteTimeout = 250 * time.Millisecond
+			opt.MaxRedirects = 1
+			client = cluster.clusterClient(opt)
+
+			err := client.ForEachNode(func(client *redis.Client) error {
+				return client.ClientPause(pause).Err()
 			})
+			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("returns an error", func() {
-			err := client.Ping().Err()
-			Expect(err).To(MatchError("ERR This instance has cluster support disabled"))
-		})
-
-		It("pipeline returns an error", func() {
-			_, err := client.Pipelined(func(pipe *redis.Pipeline) error {
-				pipe.Ping()
+		AfterEach(func() {
+			_ = client.ForEachNode(func(client *redis.Client) error {
+				defer GinkgoRecover()
+				Eventually(func() error {
+					return client.Ping().Err()
+				}, 2*pause).ShouldNot(HaveOccurred())
 				return nil
 			})
-			Expect(err).To(MatchError("ERR This instance has cluster support disabled"))
 		})
+
+		testTimeout()
 	})
 })
 
 //------------------------------------------------------------------------------
 
-func BenchmarkRedisClusterPing(b *testing.B) {
-	if testing.Short() {
-		b.Skip("skipping in short mode")
-	}
-
-	cluster := &clusterScenario{
+func newClusterScenario() *clusterScenario {
+	return &clusterScenario{
 		ports:     []string{"8220", "8221", "8222", "8223", "8224", "8225"},
 		nodeIds:   make([]string, 6),
 		processes: make(map[string]*redisProcess, 6),
 		clients:   make(map[string]*redis.Client, 6),
 	}
+}
 
+func BenchmarkClusterPing(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping in short mode")
+	}
+
+	cluster := newClusterScenario()
 	if err := startCluster(cluster); err != nil {
 		b.Fatal(err)
 	}
@@ -551,9 +1084,62 @@ func BenchmarkRedisClusterPing(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if err := client.Ping().Err(); err != nil {
+			err := client.Ping().Err()
+			if err != nil {
 				b.Fatal(err)
 			}
 		}
 	})
+}
+
+func BenchmarkClusterSetString(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping in short mode")
+	}
+
+	cluster := newClusterScenario()
+	if err := startCluster(cluster); err != nil {
+		b.Fatal(err)
+	}
+	defer stopCluster(cluster)
+
+	client := cluster.clusterClient(redisClusterOptions())
+	defer client.Close()
+
+	value := string(bytes.Repeat([]byte{'1'}, 10000))
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			err := client.Set("key", value, 0).Err()
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func BenchmarkClusterReloadState(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping in short mode")
+	}
+
+	cluster := newClusterScenario()
+	if err := startCluster(cluster); err != nil {
+		b.Fatal(err)
+	}
+	defer stopCluster(cluster)
+
+	client := cluster.clusterClient(redisClusterOptions())
+	defer client.Close()
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		err := client.ReloadState()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
 }

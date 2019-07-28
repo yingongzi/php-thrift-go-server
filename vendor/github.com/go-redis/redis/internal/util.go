@@ -1,5 +1,7 @@
 package internal
 
+import "github.com/go-redis/redis/internal/util"
+
 func ToLower(s string) string {
 	if isLower(s) {
 		return s
@@ -13,7 +15,7 @@ func ToLower(s string) string {
 		}
 		b[i] = c
 	}
-	return string(b)
+	return util.BytesToString(b)
 }
 
 func isLower(s string) bool {
